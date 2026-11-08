@@ -3,6 +3,8 @@ using Frent.Components;
 using Frent.Core;
 using Frent.Core.Archetypes;
 using Frent.Updating;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 
 namespace Frent.Marshalling;
 
@@ -93,5 +95,22 @@ public static class WorldMarshal
         archetypeRecord.Init(result);
 
         return result;
+    }
+
+    /// <summary>
+    /// Copies an entity and its component data into another world.
+    /// </summary>
+    /// <param name="destinationWorld">The world that receives the copied entity.</param>
+    /// <param name="entity">The entity to copy.</param>
+    /// <param name="callIniters">Whether to invoke init callbacks on copied components.</param>
+    /// <param name="callEvents">Whether to invoke the destination world's entity created event.</param>
+    /// <returns>The copied entity in <paramref name="destinationWorld"/>.</returns>
+    /// <remarks>When structural changes are disallowed on <paramref name="destinationWorld"/>, the copy is deferred like <see cref="World.Create()"/> and materializes when the active update or enumeration ends.</remarks>
+    public static Entity MoveEntityAcrossWorlds(World destinationWorld, Entity entity, bool callIniters, bool callEvents)
+    {
+        EntityLocation eloc = entity.AssertIsAlive(out World sourceWorld);
+        if (sourceWorld == destinationWorld)
+            return entity;
+        return destinationWorld.CopyEntityFrom(sourceWorld, eloc, entity.EntityID, callIniters, callEvents);
     }
 }

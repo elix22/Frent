@@ -138,9 +138,9 @@ internal class SparseComponentQueryTests
         var query = world.CreateQuery().With<SparseQueryComponent>().Build();
         
         var values = new List<int>();
-        foreach (var componentRef in query.Enumerate<SparseQueryComponent>())
+        foreach (var component in query.Enumerate<SparseQueryComponent>())
         {
-            values.Add(componentRef.Item1.Value.Value);
+            values.Add(component.Value);
         }
         
         CollectionAssert.Contains(values, 10);
@@ -166,6 +166,42 @@ internal class SparseComponentQueryTests
         CollectionAssert.Contains(entityComponentPairs, (entity1, 10));
         CollectionAssert.Contains(entityComponentPairs, (entity2, 20));
         That(entityComponentPairs.Count, Is.EqualTo(2));
+    }
+
+    [Test]
+    public void Query_EnumerateSparseComponent_WithoutSparseRule_Throws()
+    {
+        using World world = new();
+        world.Create<RegularQueryComponent>(new RegularQueryComponent(1.0f));
+
+        var query = world.CreateQuery()
+            .With<RegularQueryComponent>()
+            .Build();
+
+        Throws<NullReferenceException>(() =>
+        {
+            foreach (var _ in query.Enumerate<SparseQueryComponent>())
+            {
+            }
+        });
+    }
+
+    [Test]
+    public void Query_EnumerateWithEntitiesSparseComponent_WithoutSparseRule_Throws()
+    {
+        using World world = new();
+        world.Create<RegularQueryComponent>(new RegularQueryComponent(1.0f));
+
+        var query = world.CreateQuery()
+            .With<RegularQueryComponent>()
+            .Build();
+
+        Throws<NullReferenceException>(() =>
+        {
+            foreach (var _ in query.EnumerateWithEntities<SparseQueryComponent>())
+            {
+            }
+        });
     }
     
     [Test]

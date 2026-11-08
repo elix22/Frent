@@ -55,6 +55,9 @@ internal partial class WorldState : IDisposable
     private Dictionary<Entity, List<ComponentHandle>> _componentValues = [];
     private Dictionary<Entity, List<TagID>> _tagValues = [];
 
+    private readonly HashSet<(Entity Source, Entity Target, LinkID Kind)> _links = [];
+    private readonly LinkID[] _linkKinds = [Link<L1>.ID, Link<L2>.ID, Link<L3>.ID];
+
     private IEnumerable<Entity> Entities => _componentValues.Select(kvp => kvp.Key);
     private HashSet<Entity> _dead = [];
 
@@ -69,9 +72,9 @@ internal partial class WorldState : IDisposable
         _random = new Random(seed);
         _worldState = new();
 
-        _expectedEventTable = new EventRecord[13];
-        _expectedEventSubscriptions = new int[13];
-        _actualEventTable = new EventRecord[13];
+        _expectedEventTable = new EventRecord[14];
+        _expectedEventSubscriptions = new int[14];
+        _actualEventTable = new EventRecord[14];
 
         Component.RegisterComponent<object>();
     }
@@ -146,9 +149,12 @@ internal partial class WorldState : IDisposable
                 WorldActions.RemoveType => RemoveType(),
                 WorldActions.TagGeneric => TagGeneric(),
                 WorldActions.TagType => TagType(),
-                WorldActions.DetachGeneric => DetachGeneric(),
-                WorldActions.DetachType => DetachType(),
+                WorldActions.UntagGeneric => UntagGeneric(),
+                WorldActions.UntagType => UntagType(),
                 WorldActions.Set => Set(),
+                WorldActions.Link => Link(),
+                WorldActions.Unlink => Unlink(),
+                WorldActions.Clone => Clone(),
                 _ => throw new ArgumentOutOfRangeException(nameof(thisAction), thisAction, null)
             };
         }
@@ -284,7 +290,7 @@ internal partial class WorldState : IDisposable
     public void Subscribe(Entity? entity, WorldActions eventKind)
     {
         ArgumentOutOfRangeException.ThrowIfNegative((int)eventKind);
-        ArgumentOutOfRangeException.ThrowIfGreaterThan((int)eventKind, 12);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan((int)eventKind, 13);
     }
 
     public void Dispose()

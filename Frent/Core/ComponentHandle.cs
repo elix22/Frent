@@ -77,6 +77,17 @@ public readonly struct ComponentHandle : IEquatable<ComponentHandle>, IDisposabl
         return Component.ComponentTable[_componentType.RawIndex].Storage.TakeBoxed(_index);
     }
 
+    /// <summary>
+    /// Creates a new <see cref="ComponentHandle"/> containing a copy of this handle's component value.
+    /// </summary>
+    /// <remarks>The returned handle owns separate storage and must be disposed independently.</remarks>
+    /// <returns>A new <see cref="ComponentHandle"/> with the same component type and value.</returns>
+    public ComponentHandle Duplicate()
+    {
+        int duplicateIndex = ParentTable.Duplicate(_index);
+        return new ComponentHandle(duplicateIndex, _componentType);
+    }
+
     internal void InvokeComponentEventAndConsume(Entity entity, GenericEvent? @event)
     {
         Component.ComponentTable[_componentType.RawIndex].Storage.InvokeEventWithAndConsume(@event, entity, _index);
@@ -86,7 +97,7 @@ public readonly struct ComponentHandle : IEquatable<ComponentHandle>, IDisposabl
     /// Frees the memory associated with this component handle and marks it for reuse.
     /// </summary>
     /// <remarks>It is very easy to leak memory by improperly disposing of <see cref="ComponentHandle"/> instances. The handle does not check for double disposes.</remarks>
-    public void Dispose() => Component.ComponentTable[_componentType.RawIndex].Storage.Consume(_index);
+    public void Dispose() => Component.ComponentTable[_componentType.RawIndex].Storage?.Consume(_index);
     /// <summary>
     /// Checks if a <see cref="ComponentHandle"/> is equal to this handle and so points to the same component.
     /// </summary>

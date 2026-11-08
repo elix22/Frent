@@ -11,7 +11,7 @@ using System.Runtime.InteropServices;
 namespace Frent.Core.Archetypes;
 
 [DebuggerDisplay(AttributeHelpers.DebuggerDisplay)]
-internal partial class Archetype
+internal sealed partial class Archetype
 {
     internal int ComponentTypeCount => Components.Length - 1;//0 is null for hardware trap
     internal ArchetypeID ID => _archetypeID;
@@ -133,10 +133,23 @@ internal partial class Archetype
         return ref deferredCreationArchetype._entities.UnsafeArrayIndex(entityLocation.Index);
     }
 
+    internal int GetExistingOrCreateLinkID(World world, int row)
+    {
+        ref int slot = ref MemoryHelpers.GetValueOrResize(ref _worldLinkIDs, row);
+        return slot != 0 ? slot : (slot = world.CreateLinkID());
+    }
+
+    internal int GetExistingLinkID(int row)
+    {
+        Debug.Assert((uint)row < (uint)_worldLinkIDs.Length);
+        return _worldLinkIDs.UnsafeArrayIndex(row);
+    }
+
     internal void ResolveDeferredEntityCreations(World world, Archetype deferredCreationArchetype)
     {
         Debug.Assert(deferredCreationArchetype._archetypeID == _archetypeID);
         Debug.Assert(deferredCreationArchetype.DeferredEntityCount != 0);
+        Debug.Assert(deferredCreationArchetype._worldLinkIDs.Length == 0);
         int deltaFromMaxDeferredInPlace = -(_entities.Length - (NextComponentIndex + deferredCreationArchetype.DeferredEntityCount));
         int previousComponentCount = NextComponentIndex;
 
@@ -172,7 +185,6 @@ internal partial class Archetype
 
             deferredCreationArchetype._sparseBits.AsSpan(0, numBitsetsToCopy)
                 .CopyTo(_sparseBits.AsSpan(oldEntitiesLen));
-
         }
 
         NextComponentIndex += deferredCreationArchetype.DeferredEntityCount;
@@ -189,32 +201,6 @@ internal partial class Archetype
         deferredCreationArchetype.DeferredEntityCount = 0;
     }
 
-    internal Span<EntityIDOnly> CreateEntityLocations(int count, World world)
-    {
-        int newLen = NextComponentIndex + count;
-        EnsureCapacity(newLen);
-
-        Span<EntityIDOnly> entitySpan = _entities.AsSpan(NextComponentIndex, count);
-
-        int componentIndex = NextComponentIndex;
-
-        for (int i = 0; i < entitySpan.Length; i++)
-        {
-            ref EntityIDOnly archetypeEntity = ref entitySpan[i];
-
-            ref EntityLocation lookup = ref world.FindNewEntityLocation(out archetypeEntity.ID);
-
-            archetypeEntity.Version = lookup.Version;
-
-            lookup.Archetype = this;
-            lookup.Index = componentIndex++;
-            lookup.Flags = EntityFlags.None;
-        }
-
-        NextComponentIndex = componentIndex;
-
-        return entitySpan;
-    }
 
     private void Resize(int newLen)
     {
@@ -244,7 +230,7 @@ internal partial class Archetype
             return;
         }
 
-        FastStackArrayPool<EntityIDOnly>.ResizeArrayFromPool(ref _entities, count);
+        Array.Resize(ref _entities, count);
         var runners = Components;
         for (int i = 1; i < runners.Length; i++)
         {
@@ -264,7 +250,7 @@ internal partial class Archetype
         return _entities.UnsafeArrayIndex(index) = _entities.UnsafeArrayIndex(NextComponentIndex);
     }
 
-    internal EntityIDOnly DeleteEntity(int index)
+    internal EntityIDOnly DeleteEntity(World world, int index)
     {
         NextComponentIndex--;
         Debug.Assert(NextComponentIndex >= 0);
@@ -317,6 +303,7 @@ internal partial class Archetype
     end:
 
         CopyBitset(this, this, args.FromIndex, args.ToIndex);
+        MoveLinks(world, this, null, args.ToIndex, args.FromIndex, 0);
         return _entities.UnsafeArrayIndex(args.ToIndex) = _entities.UnsafeArrayIndex(args.FromIndex);
     }
 

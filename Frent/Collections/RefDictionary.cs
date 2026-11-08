@@ -7,20 +7,24 @@ using System.Runtime.InteropServices;
 namespace Frent.Collections;
 
 //[DebuggerTypeProxy(typeof(RefDictionary<,>.RefDictionaryDebugView))]
-internal class RefDictionary<TKey, TValue> where TKey : notnull
+internal sealed class RefDictionary<TKey, TValue> where TKey : notnull
 {
-    public RefDictionary()
+    private const int EndOfChain = -1;
+    private const int InactiveEntry = -2;
+
+    public RefDictionary(int capacity = 4)
     {
+        _entries = new Entry[capacity];
         foreach (ref var entry in _entries.AsSpan())
         {
-            entry.NextIndex = -2;
-            entry.BucketIndex = -1;
+            entry.NextIndex = InactiveEntry;
+            entry.BucketIndex = EndOfChain;
         }
     }
 
-    private Entry[] _entries = new Entry[4];
+    private Entry[] _entries;
     private int _next;
-    private int _free = -1;
+    private int _free = EndOfChain;
 
     [StructLayout(LayoutKind.Auto)]
     internal struct Entry
@@ -54,12 +58,12 @@ internal class RefDictionary<TKey, TValue> where TKey : notnull
 
     public void Clear()
     {
-        _free = -1;
+        _free = EndOfChain;
         _next = 0;
         foreach (ref var entry in _entries.AsSpan())
         {
-            entry.NextIndex = -2;
-            entry.BucketIndex = -1;
+            entry.NextIndex = InactiveEntry;
+            entry.BucketIndex = EndOfChain;
 
             if(RuntimeHelpers.IsReferenceOrContainsReferences<TKey>())
                 entry.Key = default!;
@@ -92,22 +96,26 @@ internal class RefDictionary<TKey, TValue> where TKey : notnull
         Debug.Assert(BitOperations.PopCount((uint)entries.Length) == 1);
 #endif
 
-        int bucket = key.GetHashCode() & (entries.Length - 1);
+        int bucket = EqualityComparer<TKey>.Default.GetHashCode(key) & (entries.Length - 1);
         ref int connectedFrom = ref entries[bucket].BucketIndex;
 
         for (int next = connectedFrom; next >= 0;)
         {
             ref Entry current = ref entries[next];
-            if (current.Key.Equals(key))
+            if (EqualityComparer<TKey>.Default.Equals(current.Key, key))
             {
                 // relink linked list
                 // say that 3 times fast
                 connectedFrom = current.NextIndex;
 
                 // add to free list
-                current.NextIndex = _free;
-                _free = next;
                 value = current.Value;
+                if (RuntimeHelpers.IsReferenceOrContainsReferences<TKey>())
+                    current.Key = default!;
+                if (RuntimeHelpers.IsReferenceOrContainsReferences<TValue>())
+                    current.Value = default!;
+                current.NextIndex = EncodeFreeListNext(_free);
+                _free = next;
                 return true;
             }
 
@@ -149,13 +157,13 @@ internal class RefDictionary<TKey, TValue> where TKey : notnull
         Debug.Assert(BitOperations.PopCount((uint)entries.Length) == 1);
 #endif
 
-        int bucket = key.GetHashCode() & (entries.Length - 1);
+        int bucket = EqualityComparer<TKey>.Default.GetHashCode(key) & (entries.Length - 1);
 
         for (int next = entries[bucket].BucketIndex; next >= 0;)
         {
             ref Entry current = ref entries[next];
 
-            if (current.Key.Equals(key))
+            if (EqualityComparer<TKey>.Default.Equals(current.Key, key))
             {
                 return ref current;
             }
@@ -170,7 +178,7 @@ internal class RefDictionary<TKey, TValue> where TKey : notnull
     {
         Entry[] entries = _entries;
         int next;
-        if (_free == -1)
+        if (_free == EndOfChain)
         {
             next = _next++;
             if (!((uint)next < (uint)entries.Length))
@@ -181,16 +189,17 @@ internal class RefDictionary<TKey, TValue> where TKey : notnull
         else
         {
             next = _free;
-            _free = entries[next].NextIndex;
+            _free = DecodeFreeListNext(entries[next].NextIndex);
         }
 
-        ref Entry bucket = ref entries[key.GetHashCode() & (entries.Length - 1)];
+        ref Entry bucket = ref entries[EqualityComparer<TKey>.Default.GetHashCode(key) & (entries.Length - 1)];
         int oldBucketIndex = bucket.BucketIndex;
         // hash -> bucket (next entry)
         bucket.BucketIndex = next;
         ref Entry nextEntry = ref entries[next];
 
         nextEntry.Key = key;
+        nextEntry.Value = default!;
         // next entry -> old entry index
         nextEntry.NextIndex = oldBucketIndex;
 
@@ -208,21 +217,32 @@ internal class RefDictionary<TKey, TValue> where TKey : notnull
         for (int i = 0; i < entries.Length; i++)
         {
             ref var entry = ref entries[i];
-            entry.NextIndex = -2;
-            entry.BucketIndex = -1;
+            entry.NextIndex = InactiveEntry;
+            entry.BucketIndex = EndOfChain;
         }
 
         _next = 0;
+        _free = EndOfChain;
 
         // rebuild
         for (int i = 0; i < oldEntries.Length; i++)
         {
             ref Entry entry = ref oldEntries[i];
-            CreateEntry(entry.Key).Value = entry.Value;
+            if (IsActive(entry.NextIndex))
+                CreateEntry(entry.Key).Value = entry.Value;
         }
 
         return ref CreateEntry(key);
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsActive(int nextIndex) => nextIndex >= EndOfChain;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int EncodeFreeListNext(int nextFree) => nextFree == EndOfChain ? InactiveEntry : -nextFree - 3;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int DecodeFreeListNext(int encodedNext) => encodedNext == InactiveEntry ? EndOfChain : -encodedNext - 3;
 
     public Enumerator GetEnumerator() => new Enumerator(_entries, _next);
 
@@ -246,7 +266,7 @@ internal class RefDictionary<TKey, TValue> where TKey : notnull
             for (_index++; _index < _count; _index++)
             {
                 ref Entry entry = ref _entries[_index];
-                if (entry.NextIndex != -2)
+                if (IsActive(entry.NextIndex))
                 {
                     _current = new KeyValuePair<TKey, TValue>(entry.Key, entry.Value);
                     return true;

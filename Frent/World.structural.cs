@@ -46,6 +46,8 @@ partial class World
 
         EntityIDOnly movedDown = from.DeleteEntityFromEntityArray(currentLookup.Index, out int deletedIndex);
 
+        Archetype.MoveLinks(this, from, destination, currentLookup.Index, deletedIndex, nextLocation.Index);
+
         ComponentStorageRecord[] fromRunners = from.Components;
         ComponentStorageRecord[] destRunners = destination.Components;
         byte[] fromMap = from.ComponentTagTable;
@@ -72,7 +74,7 @@ partial class World
         }
 
         ref var displacedEntityLocation = ref EntityTable.UnsafeIndexNoResize(movedDown.ID);
-        displacedEntityLocation.Archetype = currentLookup.Archetype;
+        // displacedEntityLocation.Archetype = currentLookup.Archetype;
         displacedEntityLocation.Index = currentLookup.Index;
 
         currentLookup.Archetype = nextLocation.Archetype;
@@ -96,6 +98,8 @@ partial class World
         Archetype.CopyBitset(from, destination, currentLookup.Index, nextLocation.Index);
 
         EntityIDOnly movedDown = from.DeleteEntityFromEntityArray(currentLookup.Index, out int deletedIndex);
+
+        Archetype.MoveLinks(this, from, destination, currentLookup.Index, deletedIndex, nextLocation.Index);
 
         ComponentStorageRecord[] fromRunners = from.Components;
         ComponentStorageRecord[] destRunners = destination.Components;
@@ -126,7 +130,7 @@ partial class World
 
         //copy everything but 
         ref var displacedEntityLocation = ref EntityTable.UnsafeIndexNoResize(movedDown.ID);
-        displacedEntityLocation.Archetype = currentLookup.Archetype;
+        // displacedEntityLocation.Archetype = currentLookup.Archetype;
         displacedEntityLocation.Index = currentLookup.Index;
 
         currentLookup.Archetype = nextLocation.Archetype;
@@ -147,6 +151,7 @@ partial class World
 
         EntityIDOnly movedDown = from.DeleteEntityFromEntityArray(currentLookup.Index, out int deletedIndex);
 
+        Archetype.MoveLinks(this, from, destination, currentLookup.Index, deletedIndex, nextLocation.Index);
 
         ComponentStorageRecord[] fromRunners = from.Components;
         ComponentStorageRecord[] destRunners = destination.Components;
@@ -164,7 +169,7 @@ partial class World
         }
 
         ref var displacedEntityLocation = ref EntityTable.UnsafeIndexNoResize(movedDown.ID);
-        displacedEntityLocation.Archetype = currentLookup.Archetype;
+        // displacedEntityLocation.Archetype = currentLookup.Archetype;
         displacedEntityLocation.Index = currentLookup.Index;
 
         currentLookup.Archetype = nextLocation.Archetype;
@@ -204,14 +209,20 @@ partial class World
 
         // entity is guaranteed to be alive here
         // entity is alive; Archetype is not null
-        EntityIDOnly replacedEntity = currentLookup.Archetype!.DeleteEntity(currentLookup.Index);
+        if (currentLookup.HasFlag(EntityFlags.HasHadLinks))
+        {
+            int worldLinkId = currentLookup.Archetype.GetExistingLinkID(currentLookup.Index);
+            UnlinkAll(worldLinkId);
+            RecycleLinkID(worldLinkId);
+        }
+        EntityIDOnly replacedEntity = currentLookup.Archetype!.DeleteEntity(this, currentLookup.Index);
 
         Debug.Assert(replacedEntity.ID < EntityTable._buffer.Length);
         Debug.Assert(entity.EntityID < EntityTable._buffer.Length);
 
         ref var replaced = ref EntityTable.UnsafeIndexNoResize(replacedEntity.ID);
         replaced.Index = currentLookup.Index;
-        replaced.Archetype = currentLookup.Archetype;
+        // replaced.Archetype = currentLookup.Archetype;
 
         currentLookup.Archetype = null!;
         currentLookup.Version++;
@@ -224,6 +235,21 @@ partial class World
             currentLookup.Index = _freelist;
             _freelist = entity.EntityID;
         }
+    }
+
+    internal void RemoveEntityPlaceholder(ref EntityLocation currentLookup)
+    {
+        if (currentLookup.HasFlag(EntityFlags.HasHadLinks))
+        {
+            int worldLinkId = currentLookup.Archetype.GetExistingLinkID(currentLookup.Index);
+            UnlinkAll(worldLinkId);
+            RecycleLinkID(worldLinkId);
+        }
+        EntityIDOnly replacedEntity = currentLookup.Archetype!.DeleteEntity(this, currentLookup.Index);
+
+        ref var replaced = ref EntityTable.UnsafeIndexNoResize(replacedEntity.ID);
+        replaced.Index = currentLookup.Index;
+        // replaced.Archetype = currentLookup.Archetype;
     }
 
     internal void CleanupSparseComponents(Entity entity, ref EntityLocation currentLookup)

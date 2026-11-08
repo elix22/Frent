@@ -28,12 +28,12 @@ namespace Frent;
  */
 
 /// <summary>
-/// A collection of entities that can be updated and queried.
+/// A collection of entities that can be updated and queried. Is not thread safe.
 /// </summary>
 public partial class World : IDisposable
 {
     #region Static Version Management
-    private static ushort _nextWorldID = 1;
+    private static int _nextWorldID = 1;
     #endregion
 
     //entity ID -> entity metadata
@@ -42,6 +42,9 @@ public partial class World : IDisposable
     //archetype ID -> Archetype
     internal WorldArchetypeTableItem[] WorldArchetypeTable;
     internal ComponentSparseSetBase[] WorldSparseSetTable;
+    // linkID -> link table entry
+    internal LinkTable[] WorldLinkTable = [];
+    internal FastStack<LinkID>[] AssociatedLinks = [];
 
     internal struct WorldArchetypeTableItem(Archetype archetype, Archetype temp)
     {
@@ -59,7 +62,7 @@ public partial class World : IDisposable
 
     private int _freeListCount;
 
-    private RefDictionary<Type, AttributeUpdateFilter> _updatesByAttributes = new();
+    private RefDictionary<Type, UpdateFilter> _updatesByAttributes = new();
     private RefDictionary<ComponentID, SingleComponentUpdateFilter> _singleComponentUpdates = new();
     internal int NextEntityID;
 
@@ -81,8 +84,8 @@ public partial class World : IDisposable
         _worldUpdateMethodCalled = false;
     }
 
-    internal FastStack<Query> QueryCache = new FastStack<Query>(4);
-
+    internal FastStack<QueryImpl> QueryCache = new FastStack<QueryImpl>(4);
+    private Action<ushort>? _queryDisposeCallbacks;
     internal CountdownEvent SharedCountdown => _sharedCountdown;
     private CountdownEvent _sharedCountdown = new(0);
     internal FastStack<ArchetypeID> EnabledArchetypes = FastStack<ArchetypeID>.Create(16);
@@ -99,7 +102,11 @@ public partial class World : IDisposable
     internal Event<ComponentID> ComponentAddedEvent = new Event<ComponentID>();
     internal Event<ComponentID> ComponentRemovedEvent = new Event<ComponentID>();
     internal TagEvent Tagged = new TagEvent();
-    internal TagEvent Detached = new TagEvent();
+    internal TagEvent Untagged = new TagEvent();
+    internal LinkEvent IncomingLinkedEvent = new LinkEvent();
+    internal LinkEvent OutgoingLinkedEvent = new LinkEvent();
+    internal LinkEvent IncomingUnlinkedEvent = new LinkEvent();
+    internal LinkEvent OutgoingUnlinkedEvent = new LinkEvent();
 
     //these lookups exists for programmical api optimization
     //normal <T1, T2...> methods use a shared global static cache
@@ -205,10 +212,56 @@ public partial class World : IDisposable
     /// <summary>
     /// Invoked whenever a tag is removed from an entity.
     /// </summary>
+    public event Action<Entity, TagID> TagUntagged
+    {
+        add => AddEvent(ref Untagged, value, EntityFlags.Untagged);
+        remove => RemoveEvent(ref Untagged, value, EntityFlags.Untagged);
+    }
+
+    /// <summary>
+    /// Invoked whenever a tag is removed from an entity.
+    /// </summary>
+    [Obsolete("Event is renamed to TagUntagged.", false)]
     public event Action<Entity, TagID> TagDetached
     {
-        add => AddEvent(ref Detached, value, EntityFlags.Detach);
-        remove => RemoveEvent(ref Detached, value, EntityFlags.Detach);
+        add => AddEvent(ref Untagged, value, EntityFlags.Untagged);
+        remove => RemoveEvent(ref Untagged, value, EntityFlags.Untagged);
+    }
+
+    /// <summary>
+    /// Invoked whenever an entity becomes the target of a link.
+    /// </summary>
+    public event Action<Entity, LinkID> IncomingLinked
+    {
+        add => AddEvent(ref IncomingLinkedEvent, value, EntityFlags.OnIncomingLinked);
+        remove => RemoveEvent(ref IncomingLinkedEvent, value, EntityFlags.OnIncomingLinked);
+    }
+
+    /// <summary>
+    /// Invoked whenever an entity becomes the source of a link.
+    /// </summary>
+    public event Action<Entity, LinkID> OutgoingLinked
+    {
+        add => AddEvent(ref OutgoingLinkedEvent, value, EntityFlags.OnOutgoingLinked);
+        remove => RemoveEvent(ref OutgoingLinkedEvent, value, EntityFlags.OnOutgoingLinked);
+    }
+
+    /// <summary>
+    /// Invoked whenever an incoming link is removed from an entity.
+    /// </summary>
+    public event Action<Entity, LinkID> IncomingUnlinked
+    {
+        add => AddEvent(ref IncomingUnlinkedEvent, value, EntityFlags.OnIncomingUnlinked);
+        remove => RemoveEvent(ref IncomingUnlinkedEvent, value, EntityFlags.OnIncomingUnlinked);
+    }
+
+    /// <summary>
+    /// Invoked whenever an outgoing link is removed from an entity.
+    /// </summary>
+    public event Action<Entity, LinkID> OutgoingUnlinked
+    {
+        add => AddEvent(ref OutgoingUnlinkedEvent, value, EntityFlags.OnOutgoingUnlinked);
+        remove => RemoveEvent(ref OutgoingUnlinkedEvent, value, EntityFlags.OnOutgoingUnlinked);
     }
 
     private void AddEvent<T>(ref Event<T> @event, Action<Entity, T> action, EntityFlags flag)
@@ -233,12 +286,13 @@ public partial class World : IDisposable
     {
         _uniformProvider = uniformProvider ?? NullUniformProvider.Instance;
         UpdateDeferredCreationEntities = updateDeferredCreationEntities;
-        WorldID = _nextWorldID++;
+        WorldID = (ushort)Interlocked.Increment(ref _nextWorldID);
 
         GlobalWorldTables.Worlds[WorldID] = this;
 
         WorldArchetypeTable = new WorldArchetypeTableItem[GlobalWorldTables.ComponentTagLocationTable.Length];
         WorldSparseSetTable = new ComponentSparseSetBase[Component.ComponentTableBySparseIndex.Count];
+        GrowLinkTable(Link.LinkTableBufferSize);
 
         for (int i = 1; i < WorldSparseSetTable.Length; i++)
             WorldSparseSetTable[i] = Component.ComponentTableBySparseIndex[i].Factory.CreateSparseSet();
@@ -262,16 +316,88 @@ public partial class World : IDisposable
     }
 
     /// <summary>
+    /// Copies the entity at <paramref name="sourceLocation"/> from <paramref name="sourceWorld"/> into this world.
+    /// </summary>
+    internal Entity CopyEntityFrom(World sourceWorld, EntityLocation sourceLocation, int sourceEntityId, bool callIniters, bool callEvents)
+    {
+        WorldArchetypeTableItem archetypes = Archetype.CreateOrGetExistingArchetype(sourceLocation.ArchetypeID, this);
+
+        ref EntityLocation eloc = ref FindNewEntityLocation(out int id);
+
+        ref var record = ref Unsafe.NullRef<EntityIDOnly>();
+        ComponentStorageRecord[] write;
+        Archetype inserted;
+
+        if (AllowStructualChanges)
+        {
+            inserted = archetypes.Archetype;
+            write = archetypes.Archetype.Components;
+            record = ref archetypes.Archetype.CreateEntityLocation(EntityFlags.None, out eloc);
+        }
+        else
+        {
+            // we don't need to manually set flags, they are already zeroed
+            record = ref archetypes.Archetype.CreateDeferredEntityLocation(this, archetypes.DeferredCreationArchetype,
+                ref eloc,
+                out write,
+                out inserted);
+            DeferredCreationEntities.Push(id);
+        }
+
+        Entity entity = new Entity(WorldID, eloc.Version, id);
+        record.Init(entity);
+
+        //read source buffers after reserving - the reservation may have resized them
+        for (int i = 1; i < write.Length; i++)
+            Array.Copy(sourceLocation.Archetype.Components[i].Buffer, sourceLocation.Index, write[i].Buffer, eloc.Index, 1);
+
+        if (sourceLocation.HasFlag(EntityFlags.HasHadSparseComponents))
+        {
+            eloc.Flags |= EntityFlags.HasHadSparseComponents;
+            Bitset sourceBits = sourceLocation.Archetype.GetBitsetNoLazy(sourceLocation.Index);
+            inserted.GetBitset(eloc.Index) = sourceBits;
+
+            foreach (int sparseComponentId in sourceBits)
+            {
+                sourceWorld.WorldSparseSetTable.UnsafeArrayIndex(sparseComponentId)
+                    .CopyTo(sourceEntityId, WorldSparseSetTable.UnsafeArrayIndex(sparseComponentId), id);
+            }
+
+            if (callIniters)
+            {
+                foreach (int sparseComponentId in sourceBits)
+                    WorldSparseSetTable.UnsafeArrayIndex(sparseComponentId).Init(entity);
+            }
+        }
+        else
+        {
+            inserted.ClearBitset(eloc.Index);
+        }
+
+        if (callIniters)
+        {
+            for (int i = 1; i < write.Length; i++)
+                write[i].CallIniter(entity, eloc.Index);
+        }
+
+        if (callEvents)
+            EntityCreatedEvent.Invoke(entity);
+
+        return entity;
+    }
+
+    /// <summary>
     /// Updates all component instances in the world that implement a component interface, e.g., <see cref="IUpdate"/>
     /// </summary>
-    public void Update()
+    public void Update(bool exclusiveUpdate = false)
     {
-        EnterDisallowState();
         EnterWorldUpdateMethod();
-        AttributeUpdateFilter? appliesTo = default;
+        EnterDisallowState();
+        UpdateFilter? appliesTo = default;
         try
         {
-            appliesTo = _updatesByAttributes.GetValueRefOrAddDefault(typeof(void), out _) ??= new AttributeUpdateFilter(this, typeof(void), true);
+            appliesTo = _updatesByAttributes.GetValueRefOrAddDefault(exclusiveUpdate ? typeof(ExclusiveUpdate) : typeof(void), out _)
+                ??= new UpdateFilter(this, typeof(void), exclusiveUpdate ? UpdateFilterMode.Exclusive : UpdateFilterMode.AllMethods);
             appliesTo.Update();
         }
         finally
@@ -293,12 +419,12 @@ public partial class World : IDisposable
     /// <param name="attributeType">The attribute type to filter</param>
     public void Update(Type attributeType)
     {
-        EnterDisallowState();
         EnterWorldUpdateMethod();
-        AttributeUpdateFilter? appliesTo = default;
+        EnterDisallowState();
+        UpdateFilter? appliesTo = default;
         try
         {
-            appliesTo = _updatesByAttributes.GetValueRefOrAddDefault(attributeType, out _) ??= new AttributeUpdateFilter(this, attributeType, false);
+            appliesTo = _updatesByAttributes.GetValueRefOrAddDefault(attributeType, out _) ??= new UpdateFilter(this, attributeType, UpdateFilterMode.Attribute);
             appliesTo.Update();
         }
         finally
@@ -314,8 +440,8 @@ public partial class World : IDisposable
     /// <param name="componentType"></param>
     public void UpdateComponent(ComponentID componentType)
     {
-        EnterDisallowState();
         EnterWorldUpdateMethod();
+        EnterDisallowState();
         SingleComponentUpdateFilter? singleComponent = null;
 
         try
@@ -348,16 +474,17 @@ public partial class World : IDisposable
     /// <param name="rules">The rules to filter entities by.</param>
     /// <remarks>The created query is not cached; it is reccomended to avoid duplicate query objects.</remarks>
     /// <returns>A query that represents entities that fullfill the ruleset.</returns>
-    public Query CreateQuery(ImmutableArray<Rule> rules)
+    public Query CreateQuery(ImmutableArray<Rule> rules) => new(CreateQueryImpl(rules));
+
+    internal QueryImpl CreateQueryImpl(ImmutableArray<Rule> rules)
     {
-        Query q = new Query(this, rules);
+        QueryImpl q = new QueryImpl(this, rules);
         QueryCache.Push(q);
         foreach (ref var element in WorldArchetypeTable.AsSpan())
             if (element.Archetype is not null)
                 q.TryAttachArchetype(element.Archetype);
         return q;
     }
-
 
     /// <summary>
     /// Returns a query builder that can be used to create a query with the specified rules.
@@ -366,11 +493,21 @@ public partial class World : IDisposable
 
     internal Query CreateQueryFromSpan(ReadOnlySpan<Rule> rules) => CreateQuery(MemoryHelpers.ReadOnlySpanToImmutableArray(rules));
 
-    internal Query BuildQuery<T>()
+    internal Query BuildQuery<T>(Func<QueryImpl, Query>? typedQueryFactory = null)
         where T : struct, IQueryBuilder
     {
         ref Query query = ref QueryInfo<T>.Queries[WorldID];
-        query ??= QueryInfo<T>.Build(this);
+        if(query is null)
+        {
+            QueryImpl queryImpl = QueryInfo<T>.Build(this);
+            query = typedQueryFactory?.Invoke(queryImpl) ?? new Query(queryImpl);
+            _queryDisposeCallbacks += QueryInfo<T>.Queries.Remove;
+        }
+        else if(typedQueryFactory is not null && query.GetType() == typeof(Query))
+        {
+            // upgrade cache
+            query = typedQueryFactory.Invoke(query.Impl);
+        }
         return query;
     }
 
@@ -380,11 +517,11 @@ public partial class World : IDisposable
         public static readonly ShortSparseSet<Query> Queries = new();
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        public static Query Build(World world)
+        public static QueryImpl Build(World world)
         {
             List<Rule> rules = [];
             default(T).AddRules(rules);
-            return world.CreateQuery(rules.ToImmutableArray());
+            return world.CreateQueryImpl(rules.ToImmutableArray());
         }
     }
 
@@ -395,6 +532,17 @@ public partial class World : IDisposable
         Array.Resize(ref WorldArchetypeTable, newSize);
 
         //World world = GlobalWorldTables.Worlds[WorldID];
+    }
+
+    internal void GrowLinkTable(int newSize)
+    {
+        int previousSize = WorldLinkTable.Length;
+        Array.Resize(ref WorldLinkTable, newSize);
+
+        for (int i = previousSize; i < WorldLinkTable.Length; i++)
+        {
+            WorldLinkTable[i] = new LinkTable();
+        }
     }
 
     internal void EnterDisallowState()
@@ -506,7 +654,7 @@ public partial class World : IDisposable
     public void Dispose()
     {
         if (_isDisposed)
-            throw new InvalidOperationException("World is already disposed!");
+            return;
         _isDisposed = true;
 
         Span<EntityLocation> tableItems = EntityTable.AsSpan();
@@ -520,6 +668,8 @@ public partial class World : IDisposable
 
 
         GlobalWorldTables.Worlds[WorldID] = null!;
+        _queryDisposeCallbacks?.Invoke(WorldID);
+        _queryDisposeCallbacks = null;
         _sharedCountdown.Dispose();
 
         //EntityTable.Dispose();
@@ -536,12 +686,12 @@ public partial class World : IDisposable
         if (components.Length > MemoryHelpers.MaxComponentCount)
             throw new ArgumentException("Max 127 components on an entity", nameof(components));
 
-        Span<ComponentHandle> componentHandles = stackalloc ComponentHandle[components.Length];
+        using ComponentHandleArray componentHandles = stackalloc ComponentHandle[components.Length];
 
         for (int i = 0; i < componentHandles.Length; i++)
             componentHandles[i] = ComponentHandle.CreateFromBoxed(components[i]);
 
-        return CreateFromHandles(componentHandles, tags);
+        return CreateFromHandles(componentHandles.Span, tags);
     }
 
     /// <summary>
@@ -562,6 +712,7 @@ public partial class World : IDisposable
     {
         Span<ComponentID> componentIDs = stackalloc ComponentID[componentHandles.Length];
         Span<int> sparseComponentIndicies = stackalloc int[componentHandles.Length];
+        Bitset sparseComponentsToCreate = default;
         bool hasSparseComponent = false;
 
         int archetypeicalComponentIdsIndex = 0;
@@ -575,6 +726,10 @@ public partial class World : IDisposable
             }
             else
             {
+                if (sparseComponentsToCreate.IsSet(sparseIndex))
+                    FrentExceptions.Throw_ComponentAlreadyExistsException(compId.Type);
+
+                sparseComponentsToCreate.Set(sparseIndex);
                 sparseComponentIndicies[i] = sparseIndex;
                 hasSparseComponent = true;
             }
@@ -627,7 +782,7 @@ public partial class World : IDisposable
             }
             else
             {
-                WorldSparseSetTable[sparseIndex].AddOrSet(id, componentHandles[i]);
+                WorldSparseSetTable[sparseIndex].Add(id, componentHandles[i]);
                 bitset.Set(sparseIndex);
             }
         }
@@ -641,7 +796,7 @@ public partial class World : IDisposable
             int sparseIndex = sparseComponentIndicies[i];
             if (sparseIndex == 0)
             {
-                archetypes.Archetype.GetComponentStorage(componentHandles[i].ComponentID)
+                inserted.GetComponentStorage(componentHandles[i].ComponentID)
                     .CallIniter(concreteEntity, eloc.Index);
             }
             else
@@ -699,6 +854,89 @@ public partial class World : IDisposable
 
     }
 
+    #region World Link IDs
+
+    // 0 is null link id
+    // this is different from LinkID
+    // LinkID is the type of the link
+    // this is an id assigned to an entity like EntityID
+    // that is used to get all link info
+    private int _nextLinkID = 1;
+    private FastStack<int> _recycledLinkIDs = FastStack<int>.Create(4);
+
+    internal int CreateLinkID()
+    {
+        if (_recycledLinkIDs.TryPop(out int recycled))
+            return recycled;
+
+        int newId = _nextLinkID++;
+        if (newId >= AssociatedLinks.Length)
+            GrowAssociatedLinkIDArray();
+        return newId;
+    }
+
+    private void GrowAssociatedLinkIDArray()
+    {
+        int oldLength = AssociatedLinks.Length;
+        Array.Resize(ref AssociatedLinks, Math.Max(1, oldLength) * 2);
+        var links = AssociatedLinks;
+        for (int i = oldLength; i < links.Length; i++)
+        {
+            links[i] = FastStack<LinkID>.Create(1);
+        }
+    }
+
+    internal void RecycleLinkID(int linkID)
+    {
+        Debug.Assert(linkID != 0);
+        AssociatedLinks[linkID].Clear();
+        _recycledLinkIDs.Push(linkID);
+    }
+
+    internal void UpdateLinkReferences(int worldLinkId, Archetype archetype, int row)
+    {
+        LinkTable[] tables = WorldLinkTable;
+
+        foreach (LinkID linkKind in AssociatedLinks[worldLinkId])
+        {
+            ref LinkTable table = ref tables.UnsafeArrayIndex(linkKind.RawValue);
+            LinkTableEntry[] outgoing = table.Outgoing;
+            LinkTableEntry[] incoming = table.Incoming;
+
+            if ((uint)worldLinkId < (uint)outgoing.Length)
+                outgoing[worldLinkId].UpdateMirrors(incoming, archetype, row);
+            if ((uint)worldLinkId < (uint)incoming.Length)
+                incoming[worldLinkId].UpdateMirrors(outgoing, archetype, row);
+        }
+    }
+
+    internal void UnlinkAll(int worldLinkId)
+    {
+        LinkTable[] tables = WorldLinkTable;
+
+        foreach (LinkID linkKind in AssociatedLinks[worldLinkId])
+        {
+            ref LinkTable table = ref tables.UnsafeArrayIndex(linkKind.RawValue);
+            LinkTableEntry[] outgoing = table.Outgoing;
+            LinkTableEntry[] incoming = table.Incoming;
+
+            if ((uint)worldLinkId < (uint)outgoing.Length)
+            {
+                ref LinkTableEntry entryo = ref outgoing[worldLinkId];
+                entryo.RemoveAllOpposing(incoming, outgoing);
+                entryo.Clear();
+            }
+
+            if ((uint)worldLinkId < (uint)incoming.Length)
+            {
+                ref LinkTableEntry entryi = ref incoming[worldLinkId];
+                entryi.RemoveAllOpposing(outgoing, incoming);
+                entryi.Clear();
+            }
+        }
+    }
+#endregion
+
     internal void InvokeEntityCreated(Entity entity)
     {
         EntityCreatedEvent.Invoke(entity);
@@ -736,4 +974,6 @@ public partial class World : IDisposable
             throw new InvalidOperationException("Initialize the world with an IUniformProvider in order to use uniforms");
         }
     }
+
+    private sealed class ExclusiveUpdate;
 }

@@ -1,7 +1,9 @@
 ﻿using Frent.Collections;
+using Frent.Components;
 using Frent.Core;
 using Frent.Core.Archetypes;
 using Frent.Core.Events;
+using Frent.Systems;
 using Frent.Variadic.Generator;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
@@ -208,37 +210,93 @@ partial struct Entity
     /// <inheritdoc cref="Add{T}(in T)"/>
     /// <variadic />
     [SkipLocalsInit]
-    public void Detach<T>()
+    public void Untag<T>()
     {
         ref EntityLocation thisLookup = ref AssertIsAlive(out World world);
 
         if (!world.AllowStructualChanges)
         {
-            world.WorldUpdateCommandBuffer.Detach<T>(this);
+            world.WorldUpdateCommandBuffer.Untag<T>(this);
             return;
         }
 
         Archetype to = TraverseThroughCacheOrCreate<TagID, NeighborCache<T>>(
             world,
-            ref NeighborCache<T>.Detach.Lookup,
+            ref NeighborCache<T>.Untag.Lookup,
             ref thisLookup,
             false);
 
         world.MoveEntityToArchetypeIso(this, ref thisLookup, to);
 
         EntityFlags flags = thisLookup.Flags | world.WorldEventFlags;
-        if (EntityLocation.HasEventFlag(flags, EntityFlags.Detach))
+        if (EntityLocation.HasEventFlag(flags, EntityFlags.Untagged))
         {
-            if (world.Detached.HasListeners)
-                InvokeTagWorldEvents<T>(ref world.Detached, this);
+            if (world.Untagged.HasListeners)
+                InvokeTagWorldEvents<T>(ref world.Untagged, this);
 
             ref EventRecord events = ref world.EventLookup.GetValueRefOrNullRef(EntityIDOnly);
             if (!Unsafe.IsNullRef(ref events))
             {
-                InvokePerEntityTagEvents<T>(this, ref events.Detach);
+                InvokePerEntityTagEvents<T>(this, ref events.Untag);
             }
         }
     }
+
+    /// <summary>
+    /// Removes a tag from this <see cref="Entity"/>
+    /// </summary>
+    /// <inheritdoc cref="Add{T}(in T)"/>
+    /// <variadic />
+    [Obsolete("Method is renamed to Untag.", false)]
+    public void Detach<T>() => Untag<T>();
+
+    /// <summary>
+    /// Enumerates the components of every <see cref="Entity"/> that links to this one with a link of type <typeparamref name="TLink"/>.
+    /// </summary>
+    /// <remarks>Linked entities that do not have every enumerated component are skipped.</remarks>
+    /// <variadic />
+    public readonly LinkEnumerable<T> EnumerateIncoming<TLink, T>() => EnumerateIncoming<T>(Core.Link<TLink>.ID);
+
+    /// <summary>
+    /// Enumerates the components of every <see cref="Entity"/> this one links to with a link of type <typeparamref name="TLink"/>.
+    /// </summary>
+    /// <inheritdoc cref="EnumerateIncoming{TLink, T}()"/>
+    /// <variadic />
+    public readonly LinkEnumerable<T> EnumerateOutgoing<TLink, T>() => EnumerateOutgoing<T>(Core.Link<TLink>.ID);
+
+    /// <summary>
+    /// Enumerates every <see cref="Entity"/> that links to this one with a link of type <typeparamref name="TLink"/>, along with their components.
+    /// </summary>
+    /// <inheritdoc cref="EnumerateIncoming{TLink, T}()"/>
+    /// <variadic />
+    public readonly EntityLinkEnumerator<T>.Enumerable EnumerateIncomingWithEntities<TLink, T>() => EnumerateIncomingWithEntities<T>(Core.Link<TLink>.ID);
+
+    /// <summary>
+    /// Enumerates every <see cref="Entity"/> this one links to with a link of type <typeparamref name="TLink"/>, along with their components.
+    /// </summary>
+    /// <inheritdoc cref="EnumerateIncoming{TLink, T}()"/>
+    /// <variadic />
+    public readonly EntityLinkEnumerator<T>.Enumerable EnumerateOutgoingWithEntities<TLink, T>() => EnumerateOutgoingWithEntities<T>(Core.Link<TLink>.ID);
+
+    /// <inheritdoc cref="EnumerateIncoming{TLink, T}()"/>
+    /// <param name="linkID">The kind of link to enumerate.</param>
+    /// <variadic />
+    public readonly LinkEnumerable<T> EnumerateIncoming<T>(LinkID linkID) => new(this, linkID, 1);
+
+    /// <inheritdoc cref="EnumerateOutgoing{TLink, T}()"/>
+    /// <param name="linkID">The kind of link to enumerate.</param>
+    /// <variadic />
+    public readonly LinkEnumerable<T> EnumerateOutgoing<T>(LinkID linkID) => new(this, linkID, 0);
+
+    /// <inheritdoc cref="EnumerateIncomingWithEntities{TLink, T}()"/>
+    /// <param name="linkID">The kind of link to enumerate.</param>
+    /// <variadic />
+    public readonly EntityLinkEnumerator<T>.Enumerable EnumerateIncomingWithEntities<T>(LinkID linkID) => new(this, linkID, 1);
+
+    /// <inheritdoc cref="EnumerateOutgoingWithEntities{TLink, T}()"/>
+    /// <param name="linkID">The kind of link to enumerate.</param>
+    /// <variadic />
+    public readonly EntityLinkEnumerator<T>.Enumerable EnumerateOutgoingWithEntities<T>(LinkID linkID) => new(this, linkID, 0);
 
     private static void InvokeComponentWorldEvents<T>(ref Event<ComponentID> @event, Entity entity)
     {
@@ -301,7 +359,7 @@ partial struct Entity
             internal static ArchetypeNeighborCache Lookup;
         }
 
-        internal static class Detach
+        internal static class Untag
         {
             internal static ArchetypeNeighborCache Lookup;
         }
@@ -349,6 +407,18 @@ partial struct Entity
                         archetypicals[index++] = maybeDelta;
                 archetypicals = archetypicals.Slice(0, index);
 
+                //measured crossover: dictionary hops beat a rehash for up to 4 deltas, beyond it the rehash wins
+                if (index <= 4)
+                {
+                    ArchetypeID destination = archetypeFromID;
+                    foreach (var delta in archetypicals)
+                        destination = add
+                            ? world.AddComponentLookup.FindAdjacentArchetypeID(delta, destination, world, ArchetypeEdgeType.AddComponent)
+                            : world.RemoveComponentLookup.FindAdjacentArchetypeID(delta, destination, world, ArchetypeEdgeType.RemoveComponent);
+                    cache.Set(archetypeFromID.RawIndex, destination.RawIndex);
+                    return destination.Archetype(world);
+                }
+
                 componentIDs = add ? MemoryHelpers.Concat(componentIDs, archetypicals)
                     : MemoryHelpers.Remove(componentIDs, archetypicals);
             }
@@ -356,6 +426,18 @@ partial struct Entity
             {
                 Span<TagID> delta = stackalloc TagID[8];
                 default(TEdge).WriteTagIDs(ref delta);
+
+                if (delta.Length <= 4)
+                {
+                    ArchetypeID destination = archetypeFromID;
+                    foreach (var d in delta)
+                        destination = add
+                            ? world.AddTagLookup.FindAdjacentArchetypeID(d, destination, world, ArchetypeEdgeType.AddTag)
+                            : world.RemoveTagLookup.FindAdjacentArchetypeID(d, destination, world, ArchetypeEdgeType.RemoveTag);
+                    cache.Set(archetypeFromID.RawIndex, destination.RawIndex);
+                    return destination.Archetype(world);
+                }
+
                 tagIDs = add ? MemoryHelpers.Concat(tagIDs, delta)
                     : MemoryHelpers.Remove(tagIDs, delta);
             }

@@ -7,6 +7,7 @@ using System.Text.Json;
 using static NUnit.Framework.Assert;
 using Frent.Components;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace Frent.Tests;
 
@@ -43,6 +44,22 @@ internal class SerializationTests
     }
 
     [Test]
+    public void TestSerializationWithTagsOnly()
+    {
+        using World world = new();
+        var entity = world.Create();
+        entity.Tag<Tag>();
+
+        string json = JsonWorldSerializer.Default.Serialize(world);
+        using World deserialized = JsonWorldSerializer.Default.Deserialize(json);
+
+        var query = deserialized.CreateQuery().Build();
+        Entity deserializedEntity = GetFirstEntity(query);
+        That(deserializedEntity.Tagged<Tag>(), Is.True);
+    }
+
+
+    [Test]
     public void TestCustomSerializerOptions()
     {
         var options = new JsonSerializerOptions(JsonSerializerOptions.Default)
@@ -74,8 +91,8 @@ internal class SerializationTests
         using World deserialized = JsonWorldSerializer.Default.Deserialize(json);
 
         var allQuery = deserialized.CreateQuery().Build();
-        var intQuery = deserialized.CreateQuery().With<int>().Build();
-        var stringQuery = deserialized.CreateQuery().With<string>().Build();
+        var intQuery = deserialized.Query<int>();
+        var stringQuery = deserialized.Query<string>();
 
         That(CountEntities(allQuery), Is.EqualTo(1));
         That(CountEntities(intQuery), Is.EqualTo(1));
@@ -136,6 +153,144 @@ internal class SerializationTests
         That(deserializedEntity.Get<CallbackTestComponent>().Archetype, Is.EqualTo(archetype));
     }
 
+    [Test]
+    public void Serialize_IgnoresNonSerializableComponent_MetadataStaysAligned()
+    {
+        JsonSerializerOptions options = new()
+        {
+            TypeInfoResolver = new BlockingResolver(typeof(NotSerializableComponent))
+        };
+        JsonWorldSerializer serializer = new(options, ignoreNonSerializableComponents: true);
+
+        using World world = new();
+        world.Create(42, new NotSerializableComponent(123));
+
+        string json = serializer.Serialize(world);
+        using World deserialized = serializer.Deserialize(json);
+
+        Entity deserializedEntity = GetFirstEntity(deserialized.CreateQuery().Build());
+
+        That(json, Does.Not.Contain(typeof(NotSerializableComponent).ToString()));
+        That(deserializedEntity.Get<int>(), Is.EqualTo(42));
+        That(deserializedEntity.TryHas<NotSerializableComponent>(), Is.False);
+    }
+
+    [Test]
+    public void SerializeDeserialize_SparseComponent_RoundTrips()
+    {
+        using World world = new();
+        world.Create(new SerializableSparseComponent { Value = 37 });
+
+        string json = JsonWorldSerializer.Default.Serialize(world);
+        using World deserialized = JsonWorldSerializer.Default.Deserialize(json);
+
+        Entity deserializedEntity = GetFirstEntity(deserialized.Query<SerializableSparseComponent>());
+
+        That(deserializedEntity.Get<SerializableSparseComponent>().Value, Is.EqualTo(37));
+    }
+
+    [Test]
+    public void Deserialize_InvokeInitersFalse_DoesNotInvokeIniters()
+    {
+        using World world = new();
+        world.Create(
+            new SerializableInitComponent { Value = 11 },
+            new SerializableSparseInitComponent { Value = 22 });
+
+        string json = JsonWorldSerializer.Default.Serialize(world);
+        ResetSerializationIniterCounts();
+
+        using World deserialized = JsonWorldSerializer.Default.Deserialize(json, invokeIniters: false);
+
+        That(SerializableInitComponent.InitCount, Is.Zero);
+        That(SerializableSparseInitComponent.InitCount, Is.Zero);
+    }
+
+    [Test]
+    public void InheritedComponentType_KeepsType_RoundTrip()
+    {
+        using World world = new();
+        world.Create((BaseClass)new ChildClass());
+
+        string json = JsonWorldSerializer.Default.Serialize(world);
+
+        using World deserialized = JsonWorldSerializer.Default.Deserialize(json);
+
+        Entity deserializedEntity = GetFirstEntity(deserialized.Query<BaseClass>());
+        That(deserializedEntity.Get<BaseClass>() is ChildClass);
+    }
+
+    [Test]
+    public void Deserialize_InvokeInitersTrue_InvokesEachIniterOnce()
+    {
+        using World world = new();
+        world.Create(
+            new SerializableInitComponent { Value = 11 },
+            new SerializableSparseInitComponent { Value = 22 });
+
+        string json = JsonWorldSerializer.Default.Serialize(world);
+        ResetSerializationIniterCounts();
+
+        using World deserialized = JsonWorldSerializer.Default.Deserialize(json, invokeIniters: true);
+
+        That(SerializableInitComponent.InitCount, Is.EqualTo(1));
+        That(SerializableSparseInitComponent.InitCount, Is.EqualTo(1));
+    }
+
+    private static void ResetSerializationIniterCounts()
+    {
+        SerializableInitComponent.InitCount = 0;
+        SerializableSparseInitComponent.InitCount = 0;
+    }
+
+    [Test]
+    public void TestSerializationWithLinks()
+    {
+        using World world = new();
+        Entity a = world.Create<int>(1);
+        Entity b = world.Create<int>(2);
+        Entity c = world.Create<int>(3);
+        a.Link<LinkChild>(b);
+        a.Link<LinkChild>(c);
+        c.Link<LinkOwns>(a);
+
+        string json = JsonWorldSerializer.Default.Serialize(world);
+        using World deserialized = JsonWorldSerializer.Default.Deserialize(json);
+
+        Entity da = default, db = default, dc = default;
+        foreach (Entity e in deserialized.CreateQuery().Build().EnumerateWithEntities())
+        {
+            switch (e.Get<int>())
+            {
+                case 1: da = e; break;
+                case 2: db = e; break;
+                case 3: dc = e; break;
+            }
+        }
+
+        That(da.IsNull, Is.False);
+        That(db.IsNull, Is.False);
+        That(dc.IsNull, Is.False);
+
+        List<int> childTargets = [];
+        foreach (Entity t in da.EnumerateOutgoingWithEntities<LinkChild>())
+            childTargets.Add(t.Get<int>());
+        childTargets.Sort();
+        That(childTargets, Is.EqualTo(new[] { 2, 3 }));
+
+        List<int> ownsTargets = [];
+        foreach (Entity t in dc.EnumerateOutgoingWithEntities<LinkOwns>())
+            ownsTargets.Add(t.Get<int>());
+        That(ownsTargets, Is.EqualTo(new[] { 1 }));
+
+        That(db.HasIncomingLink<LinkChild>(), Is.True);
+        That(da.HasIncomingLink<LinkOwns>(), Is.True);
+        That(da.HasOutgoingLink<LinkOwns>(), Is.False);
+    }
+
+    internal struct LinkChild : ILink;
+    internal struct LinkOwns : ILink;
+
     private static Entity GetFirstEntity(Query query)
     {
         foreach (var entity in query.EnumerateWithEntities())
@@ -161,5 +316,47 @@ internal class SerializationTests
     {
         public EntityType Archetype { get; set; }
         public ComponentID ComponentType { get; set; }
+    }
+
+    internal record struct NotSerializableComponent(int Value);
+
+    internal struct SerializableSparseComponent : ISparseComponent
+    {
+        public int Value { get; set; }
+    }
+
+    internal struct SerializableInitComponent : IInitable
+    {
+        public static int InitCount;
+        public int Value { get; set; }
+
+        public void Init(Entity self)
+        {
+            InitCount++;
+        }
+    }
+
+    internal struct SerializableSparseInitComponent : ISparseComponent, IInitable
+    {
+        public static int InitCount;
+        public int Value { get; set; }
+
+        public void Init(Entity self)
+        {
+            InitCount++;
+        }
+    }
+
+    private sealed class BlockingResolver(Type blockedType) : IJsonTypeInfoResolver
+    {
+        private readonly DefaultJsonTypeInfoResolver _inner = new();
+
+        public JsonTypeInfo? GetTypeInfo(Type type, JsonSerializerOptions options)
+        {
+            if (type == blockedType)
+                return null;
+
+            return _inner.GetTypeInfo(type, options);
+        }
     }
 }

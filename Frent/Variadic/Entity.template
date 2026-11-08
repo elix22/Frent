@@ -50,9 +50,9 @@ to:
 |
 
 from:
-            world.WorldUpdateCommandBuffer.Detach<T>(this);
+            world.WorldUpdateCommandBuffer.Untag<T>(this);
 to:
-|            world.WorldUpdateCommandBuffer.Detach<T$>(this);
+|            world.WorldUpdateCommandBuffer.Untag<T$>(this);
 |
 
 from:
@@ -200,6 +200,41 @@ to:
 Detach<|T$, |>
 
 from:
+Untag<T>
+to:
+Untag<|T$, |>
+
+from:
             ids = ids.Slice(0, 1);
 to:
             ids = ids.Slice(0, $);
+
+from:
+LinkEnumerable<T>
+to:
+LinkEnumerable<|T$, |>
+
+from:
+EntityLinkEnumerator<T>.Enumerable
+to:
+EntityLinkEnumerator<|T$, |>.Enumerable
+
+from:
+{TLink, T}()
+to:
+{TLink, |T$, |}()
+
+from:
+<TLink, T>()
+to:
+<TLink, |T$, |>()
+
+from:
+<T>(Core.Link<TLink>.ID)
+to:
+<|T$, |>(Core.Link<TLink>.ID)
+
+from:
+<T>(LinkID linkID)
+to:
+<|T$, |>(LinkID linkID)
