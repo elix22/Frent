@@ -1,4 +1,4 @@
-arity: 16
+arity: 15
 from:
     /// <summary>
     /// A reference to the current component.

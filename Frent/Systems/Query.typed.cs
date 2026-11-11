@@ -6,7 +6,7 @@ namespace Frent.Systems;
 /// A query over entities with the specified component types, which can be enumerated directly in foreach loops.
 /// </summary>
 /// <variadic />
-[Variadic("<T>", "<|T$, |>", 16)]
+[Variadic("<T>", "<|T$, |>", 15)]
 public partial class Query<T> : Query
 {
     internal Query(QueryImpl impl)
